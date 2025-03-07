@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Détecteur de Codes-barres YOLO</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tensorflow/4.15.0/tf.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            text-align: center;
+        }
+        #video-container {
+            position: relative;
+            margin: 20px auto;
+            max-width: 640px;
+            width: 100%;
+        }
+        #video {
+            width: 100%;
+            border: 2px solid #333;
+            border-radius: 8px;
+        }
+        #canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        button {
+            background-color: #4CAF50;
+            border: none;
+            color: white;
+            padding: 15px 32px;
+            text-align: center;
+            text-decoration: none;
+            display: inline-block;
+            font-size: 16px;
+            margin: 4px 2px;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        #loading {
+            display: none;
+            color: #666;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>Détecteur de Codes-barres YOLO</h1>
+    <div id="loading">Chargement du modèle...</div>
+    <div id="video-container">
+        <video id="video" autoplay playsinline></video>
+        <canvas id="canvas"></canvas>
+    </div>
+    <button id="startButton">Activer la caméra</button>
+    <div id="result"></div>
+
+    <script>
+        let model = null;
+        let isModelLoaded = false;
+        let isProcessing = false;
+
+        let SRV_URL = "ws://localhost:8000/ws"
+        let ws = null;
+        let wsConnected = false;
+        let connectionAttempts = 0;
+        const MAX_ATTEMPTS = 5;
+        const RETRY_INTERVAL = 5000; // 5 secondes
+        
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const startButton = document.getElementById('startButton');
+        const resultDiv = document.getElementById('result');
+        const loadingDiv = document.getElementById('loading');
+
+
+
+        // Configuration du modèle
+        const modelConfig = {
+            modelUrl: "http://..../web_model/model.json",
+            inputSize: 640,
+            scoreThreshold: 0.7,
+            iouThreshold: 0.5
+        };
+
+        // Prétraitement de l'image
+        function preprocessImage(imageTensor) {
+            // Redimensionnement
+            let resized = tf.image.resizeBilinear(imageTensor, [modelConfig.inputSize, modelConfig.inputSize]);
+            // Normalisation
+            let normalized = resized.div(255.0);
+            // Ajout de la dimension batch
+            return normalized.expandDims(0);
+        }
+
+        // Chargement du modèle
+        async function loadModel() {
+            loadingDiv.style.display = 'block';
+            try {
+                model = await tf.loadGraphModel(modelConfig.modelUrl);
+                isModelLoaded = true;
+                loadingDiv.style.display = 'none';
+                console.log('Modèle chargé avec succès');
+                // Tenter la connexion WebSocket après le chargement du modèle
+                await connectWebSocket();
+            } catch (error) {
+                console.error('Erreur lors du chargement du modèle:', error);
+                loadingDiv.textContent = 'Erreur lors du chargement du modèle';
+            }
+        }
+
+        // Activation de la caméra
+        startButton.addEventListener('click', async () => {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: 'environment',
+                        width: { ideal: modelConfig.inputSize },
+                        height: { ideal: modelConfig.inputSize }
+                    }
+                });
+                video.srcObject = stream;
+                startButton.disabled = true;
+                
+                // Ajuster la taille du canvas à la vidéo
+                video.onloadedmetadata = () => {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    startDetection();
+                };
+            } catch (error) {
+                console.error('Erreur lors de l\'accès à la caméra:', error);
+                resultDiv.textContent = 'Erreur: Impossible d\'accéder à la caméra';
+            }
+        });
+
+        // Dessin des détections (optionnel)
+        function drawDetections(detections) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            detections.forEach(detection => {
+                const [x1, y1, x2, y2] = detection.bbox;
+                const score = detection.score;
+                const label = detection.class;
+
+                // Dessiner le rectangle
+                ctx.strokeStyle = '#00ff00';
+                ctx.lineWidth = 2;
+                //ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+                ctx.strokeRect(y1, canvas.width - x2, y2 - y1, x2 - x1);
+                // Dessiner le label
+                ctx.fillStyle = '#00ff00';
+                ctx.font = '16px Arial';
+                ctx.fillText(`${label}: ${Math.round(score * 100)}%`, x1, y1 - 5);
+            });
+        }
+
+        async function detectBarcode() {
+            if (!isModelLoaded || !video.srcObject || isProcessing) return;
+            isProcessing = true;
+
+            try {
+                tf.engine().startScope(); // Gestion mémoire
+
+                // Capture et prétraitement de l'image
+                const videoFrame = tf.browser.fromPixels(video);
+                const processedImage = preprocessImage(videoFrame);
+
+                // Exécuter YOLO
+                const predictions = model.execute(processedImage);
+                const rawOutput = predictions.arraySync()[0];
+
+                const numDetections = rawOutput[0].length;
+                const detections = [];
+
+                let barcodeDetected = false; // Variable pour savoir si on a trouvé un code-barres
+
+                for (let i = 0; i < numDetections; i++) {
+                    const x1 = rawOutput[0][i];
+                    const y1 = rawOutput[1][i];
+                    const x2 = rawOutput[2][i];
+                    const y2 = rawOutput[3][i];
+                    const score = rawOutput[4][i];
+
+                    // Vérifie si c'est un code-barres et que la confiance est suffisante
+                    if (score > modelConfig.scoreThreshold) {
+                        detections.push({ bbox: [x1, y1, x2, y2], score });
+                        barcodeDetected = true; // Marque qu'on a détecté un code-barres
+                    }
+                }
+
+                // Dessiner les boîtes détectées
+                drawDetections(detections);
+
+                // 🚀 Si un code-barres est détecté, capturer et envoyer l'image !
+                if (barcodeDetected) {
+                    console.log("📸 Code-barres détecté ! Envoi de l'image au serveur...");
+                    sendImageToServer();
+                }
+
+                // Nettoyage mémoire
+                tf.dispose([videoFrame, processedImage, predictions]);
+
+            } catch (error) {
+                console.error('Erreur lors de la détection:', error);
+            } finally {
+                tf.engine().endScope();
+                isProcessing = false;
+            }
+        }
+
+        // Boucle de détection
+        function startDetection() {
+            setInterval(detectBarcode, 1000); // Détection 10 fois par seconde, chaque 100 ms
+        }
+
+        // Chargement du modèle au démarrage
+        loadModel();
+
+        // Fonction pour capturer une image et l'envoyer au serveur si un code-barres est détecté
+        async function sendImageToServer() {
+
+            if (!wsConnected) {
+                const connected = await connectWebSocket();
+                if (!connected) location.reload();
+            }
+
+            const canvasCapture = document.createElement("canvas");
+            const ctxCapture = canvasCapture.getContext("2d");
+            canvasCapture.width = video.videoWidth;
+            canvasCapture.height = video.videoHeight;
+            ctxCapture.drawImage(video, 0, 0, canvasCapture.width, canvasCapture.height);
+            
+            // Convertir l'image en base64 et envoyer via WebSocket
+            canvasCapture.toBlob((blob) => {
+                const reader = new FileReader();
+                reader.readAsDataURL(blob);
+                reader.onloadend = () => {
+                    const base64Data = reader.result.split(",")[1]; // Supprimer le préfixe "data:image/png;base64,"
+                    ws.send(base64Data);
+                };
+            }, "image/png", 0.8);  // Compression à 80%
+        }
+
+        // Fonction pour créer une popup
+        function createPopup(message) {
+            const popup = document.createElement('div');
+            popup.style.cssText = `
+                position: fixed;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                background: white;
+                padding: 20px;
+                border-radius: 5px;
+                box-shadow: 0 0 10px rgba(0,0,0,0.5);
+                z-index: 1000;
+            `;
+            popup.textContent = message;
+            document.body.appendChild(popup);
+            return popup;
+        }
+
+
+        // Fonction de connexion WebSocket avec tentatives
+        async function connectWebSocket() {
+            if (wsConnected) return true;
+            
+            const popup = createPopup("En attente de connexion au serveur...");
+            
+            while (connectionAttempts < MAX_ATTEMPTS) {
+                try {
+                    ws = new WebSocket(SRV_URL);
+                    
+                    return await new Promise((resolve, reject) => {
+                        ws.onopen = () => {
+                            console.log("WebSocket connecté !");
+                            wsConnected = true;
+                            popup.remove();
+                            resolve(true);
+                        };
+                        
+                        ws.onerror = (error) => {
+                            console.error("WebSocket erreur:", error);
+                            reject(error);
+                        };
+                        
+                        ws.onclose = () => {
+                            console.log("WebSocket fermé !");
+                            wsConnected = false;
+                        };
+                        
+                        ws.onmessage = (event) => {
+                            console.log("Code-barre reçu:", event.data);
+                            document.getElementById("result").textContent = "Code-barre détecté : " + event.data;
+                        };
+                    });
+                } catch (error) {
+                    connectionAttempts++;
+                    if (connectionAttempts >= MAX_ATTEMPTS) {
+                        popup.textContent = "Impossible de scanner votre code-barres pour le moment, merci de réessayer ultérieurement.";
+                        setTimeout(() => {popup.remove(); } , 3000);
+                        return false;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, RETRY_INTERVAL));
+                }
+            }
+        }
+
+    </script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+fastapi
+numpy
+pyzbar
+pillow
+uvicorn[standard]
